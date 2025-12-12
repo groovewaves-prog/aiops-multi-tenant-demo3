@@ -31,53 +31,93 @@ def sanitize_output(text: str) -> str:
         text = re.sub(pattern, replacement, text)
     return text
 
-def generate_fake_log_by_ai(scenario_name, api_key):
+def generate_fake_log_by_ai(scenario_name, target_node, api_key):
+    """
+    メタデータ駆動でログを生成する (ハードコーディング廃止)
+    """
     if not api_key: return "Error: API Key Missing"
-    genai.configure(api_key=api_key)
-    # ★変更: gemini-1.5-flash
-    model = genai.GenerativeModel("gemini-1.5-flash")
     
-    # --- Device Context ---
-    if "[FW]" in scenario_name:
-        device_model = "Juniper SRX300"
-        os_type = "Junos OS"
-        target_name = "FW_01_PRIMARY"
-    elif "[L2SW]" in scenario_name:
-        device_model = "Cisco Catalyst 9300"
-        os_type = "Cisco IOS-XE"
-        target_name = "L2_SW_01"
-    else:
-        device_model = "Cisco ISR 4451-X"
-        os_type = "Cisco IOS-XE"
-        target_name = "WAN_ROUTER_01"
+    genai.configure(api_key=api_key)
+    # ★変更: gemini-2.0-flash-lite + 温度0
+    model = genai.GenerativeModel(
+        "gemini-2.0-flash-lite",
+        generation_config={"temperature": 0.0}
+    )
+    
+    # --- 1. メタデータから機器情報を取得 ---
+    # target_node は data.py の NetworkNode オブジェクト
+    vendor = target_node.metadata.get("vendor", "Cisco")
+    os_type = target_node.metadata.get("os", "IOS")
+    model_name = target_node.metadata.get("model", "Generic Router")
+    hostname = target_node.id
 
-    # --- Failure Context ---
+    # --- 2. 障害状態の定義 (OS非依存の抽象的な指示) ---
+    # 「Junosコマンドを使え」とは書かず、「こういう状態を作れ」と指示する
     status_instructions = ""
-    if "[FW]" in scenario_name:
-        if "電源" in scenario_name and "片系" in scenario_name:
-            status_instructions = "Junosコマンド `show chassis environment` で PSU 0: Failed, PSU 1: OK を表示せよ。"
-        elif "FAN" in scenario_name:
-            status_instructions = "Junosコマンド `show chassis environment` で Fan: Failed を表示せよ。"
-        elif "メモリ" in scenario_name:
-            status_instructions = "Junosコマンド `show system processes extensive` で特定プロセス(flowd等)がメモリを大量消費している様子を表示せよ。"
-    elif "電源" in scenario_name and "片系" in scenario_name:
-        status_instructions = "IOSコマンド `show environment` で PS1: Fail を表示せよ。"
+    
+    if "電源" in scenario_name and "片系" in scenario_name:
+        status_instructions = """
+        【状態定義: 電源冗長稼働中 (片系ダウン)】
+        1. ハードウェアステータス:
+           - Power Supply 1: **Faulty / Failed**
+           - Power Supply 2: **OK / Good**
+        2. サービス影響: なし (インターフェース UP, Ping 成功)
+        3. エラーログ: 電源障害を示すSyslogまたはTrapを含めること。
+        """
+    elif "電源" in scenario_name and "両系" in scenario_name:
+        status_instructions = """
+        【状態定義: 全電源喪失】
+        1. ログ: "Connection Refused" または再起動直後のブートログのみ。
+        """
     elif "FAN" in scenario_name:
-        status_instructions = "IOSコマンド `show environment` で Fan: Fail を表示せよ。"
+        status_instructions = """
+        【状態定義: ファン故障】
+        1. ハードウェアステータス: Fan Tray 1 **Failure**
+        2. 温度: 上昇中だが閾値内 (Warning)
+        3. サービス影響: なし
+        """
     elif "メモリ" in scenario_name:
-        status_instructions = "IOSコマンド `show processes memory` で特定プロセスがメモリ消費大であることを表示せよ。"
+        status_instructions = """
+        【状態定義: メモリリーク】
+        1. メモリ使用率: **98%以上**
+        2. プロセス: 特定のプロセス（例: SSHD, FlowMonitor等）が異常消費している様子を明確に示すこと。
+        3. Syslog: メモリ割り当て失敗 (Malloc Fail) を含めること。
+        """
     elif "BGP" in scenario_name:
-        status_instructions = "BGP Neighbor State が Idle/Active を繰り返すログにせよ。"
+        status_instructions = """
+        【状態定義: BGPフラッピング】
+        1. BGP状態: 特定のNeighborが Idle / Active を繰り返している。
+        2. 物理IF: UP/UP
+        """
     elif "全回線断" in scenario_name:
-        status_instructions = "Interface DOWN/DOWN, Ping 100% Loss."
+        status_instructions = """
+        【状態定義: 物理リンクダウン】
+        1. 主要インターフェース: **DOWN / DOWN** (Carrier Loss)
+        2. Ping: 100% Loss
+        """
 
+    # --- 3. プロンプト生成 ---
     prompt = f"""
     あなたはネットワーク機器のCLIシミュレーターです。
-    シナリオ: {scenario_name}
-    対象機器: {target_name} ({device_model}, {os_type})
+    指定された機器スペックと障害シナリオに基づき、エンジニアが調査を行った際の「コマンド実行ログ」を生成してください。
+
+    **対象機器スペック**:
+    - Hostname: {hostname}
+    - Vendor: {vendor}
+    - OS: {os_type}
+    - Model: {model_name}
+
+    **発生シナリオ**: {scenario_name}
+
     {status_instructions}
-    出力ルール: 解説不要。CLIの生テキストのみ出力。障害原因を明確に。
+
+    **出力要件**:
+    1. **{vendor} {os_type}** の構文として正しいコマンドと出力形式を使用すること。
+       (例: Ciscoなら 'show env', Juniperなら 'show chassis environment' など、AIが自動判断すること)
+    2. 解説やMarkdown装飾は不要。**CLIの生テキストのみ**を出力すること。
+    3. 矛盾する情報は含めないこと。
     """
+    
     try:
         response = model.generate_content(prompt)
         return response.text
@@ -87,16 +127,17 @@ def generate_fake_log_by_ai(scenario_name, api_key):
 def generate_config_from_intent(target_node, current_config, intent_text, api_key):
     if not api_key: return "Error: API Key Missing"
     genai.configure(api_key=api_key)
-    # ★変更: gemini-1.5-flash
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash-lite", generation_config={"temperature": 0.0})
     
     vendor = target_node.metadata.get("vendor", "Cisco")
+    os_type = target_node.metadata.get("os", "IOS")
+    
     prompt = f"""
     ネットワーク設定生成。
-    対象: {target_node.id} ({vendor})
+    対象: {target_node.id} ({vendor} {os_type})
     現在のConfig: {current_config}
     Intent: {intent_text}
-    出力: コマンドのみ
+    出力: 投入用コマンドのみ (Markdownコードブロック)
     """
     try:
         response = model.generate_content(prompt)
@@ -107,30 +148,39 @@ def generate_config_from_intent(target_node, current_config, intent_text, api_ke
 def generate_health_check_commands(target_node, api_key):
     if not api_key: return "Error: API Key Missing"
     genai.configure(api_key=api_key)
-    # ★変更: gemini-1.5-flash
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = genai.GenerativeModel("gemini-2.0-flash-lite", generation_config={"temperature": 0.0})
     
     vendor = target_node.metadata.get("vendor", "Cisco")
-    prompt = f"Netmiko正常性確認コマンドを3つ生成せよ。対象: {vendor}。出力: コマンドのみ箇条書き"
+    os_type = target_node.metadata.get("os", "IOS")
+    
+    prompt = f"Netmiko正常性確認コマンドを3つ生成せよ。対象: {vendor} {os_type}。出力: コマンドのみ箇条書き"
     try:
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
         return f"Command Gen Error: {e}"
 
-def run_diagnostic_simulation(scenario_type, api_key=None):
+def run_diagnostic_simulation(scenario_type, target_node=None, api_key=None):
+    """
+    診断実行関数 (修正版: target_nodeを受け取る)
+    """
     time.sleep(1.5)
     
+    status = "SUCCESS"
+    raw_output = ""
+    error_msg = None
+
     if "---" in scenario_type or "正常" in scenario_type:
         return {"status": "SKIPPED", "sanitized_log": "No action required.", "error": None}
 
     if "[Live]" in scenario_type:
+        # Liveモードのコード (変更なし)
         commands = ["terminal length 0", "show version", "show interface brief", "show ip route"]
         try:
             with ConnectHandler(**SANDBOX_DEVICE) as ssh:
                 if not ssh.check_enable_mode(): ssh.enable()
                 prompt = ssh.find_prompt()
-                raw_output = f"Connected to: {prompt}\n"
+                raw_output += f"Connected to: {prompt}\n"
                 for cmd in commands:
                     output = ssh.send_command(cmd)
                     raw_output += f"\n{'='*30}\n[Command] {cmd}\n{output}\n"
@@ -138,12 +188,15 @@ def run_diagnostic_simulation(scenario_type, api_key=None):
             return {"status": "ERROR", "sanitized_log": "", "error": str(e)}
         return {"status": "SUCCESS", "sanitized_log": sanitize_output(raw_output), "error": None}
             
+    # 全断・サイレントなど、機器に関わらず接続不可なケース
     elif "全回線断" in scenario_type or "サイレント" in scenario_type or "両系" in scenario_type:
         return {"status": "ERROR", "sanitized_log": "", "error": "Connection timed out"}
 
+    # AI生成ケース
     else:
-        if api_key:
-            raw_output = generate_fake_log_by_ai(scenario_type, api_key)
+        if api_key and target_node:
+            # ★ここで target_node を渡す
+            raw_output = generate_fake_log_by_ai(scenario_type, target_node, api_key)
             return {"status": "SUCCESS", "sanitized_log": sanitize_output(raw_output), "error": None}
         else:
-            return {"status": "ERROR", "sanitized_log": "", "error": "API Key Required"}
+            return {"status": "ERROR", "sanitized_log": "", "error": "API Key or Target Node Missing"}
