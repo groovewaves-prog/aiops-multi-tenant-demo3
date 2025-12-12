@@ -234,8 +234,8 @@ if app_mode == "🚨 障害対応":
         should_start_chat = (st.session_state.chat_session is None) and (selected_scenario != "正常稼働")
         if should_start_chat:
             genai.configure(api_key=api_key)
-            # ★変更: gemini-1.5-flash-latest
-            model = genai.GenerativeModel("gemini-1.5-flash-latest", generation_config={"temperature": 0.0})
+            # ★変更: gemini-2.0-flash-lite
+            model = genai.GenerativeModel("gemini-2.0-flash-lite", generation_config={"temperature": 0.0, "max_output_tokens": 1500})
             
             system_prompt = ""
             if st.session_state.live_result:
