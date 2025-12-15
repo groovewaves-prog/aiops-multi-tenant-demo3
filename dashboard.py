@@ -1,21 +1,46 @@
 import streamlit as st
 import pandas as pd
+import random
 
-def render_intelligent_alarm_viewer(bayes_engine, selected_scenario):
+def render_intelligent_alarm_viewer(bayes_engine, selected_scenario, current_alarms):
     """
     AIOps時代のインシデント管理ビューアー（インタラクティブ版）
-    行をクリックすると詳細を選択可能
     """
     st.markdown("### 🛡️ AIOps インシデント・コックピット")
     
-    # 1. KPIメトリクス
+    # --- 動的なアラーム数計算ロジック ---
+    # 実際の「根本アラーム数」を取得
+    actual_alarm_count = len(current_alarms)
+    
+    # シミュレーション: 
+    # 実際の障害1件につき、平均15〜30件の「ノイズ（Ping断や連鎖エラー）」が発生していると仮定
+    # シナリオが「正常」なら0
+    if selected_scenario == "正常稼働":
+        raw_alarm_count = 0
+        suppressed_count = 0
+        incident_count = 0
+        noise_reduction_rate = "100%"
+    else:
+        # ノイズ倍率 (AIOpsの効果を演出)
+        noise_factor = random.randint(12, 25) 
+        if actual_alarm_count == 0: actual_alarm_count = 1 # 強制的に1以上にする（デモ演出用）
+        
+        raw_alarm_count = actual_alarm_count * noise_factor
+        suppressed_count = raw_alarm_count - 1 # 1つのインシデントに集約されたと仮定
+        incident_count = 1
+        
+        # 削減率計算
+        reduction = (suppressed_count / raw_alarm_count) * 100
+        noise_reduction_rate = f"{reduction:.1f}%"
+
+    # 1. KPIメトリクス表示
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric(label="📉 ノイズ削減率", value="98.5%", delta="高効率稼働中")
+        st.metric(label="📉 ノイズ削減率", value=noise_reduction_rate, delta="高効率稼働中")
     with col2:
-        st.metric(label="📨 処理したアラーム総数", value="154件", delta="-153件 (抑制済)", delta_color="inverse")
+        st.metric(label="📨 処理したアラーム総数", value=f"{raw_alarm_count}件", delta=f"-{suppressed_count}件 (抑制済)", delta_color="inverse")
     with col3:
-        st.metric(label="🚨 要対応インシデント", value="1件", delta="対処が必要")
+        st.metric(label="🚨 要対応インシデント", value=f"{incident_count}件", delta="対処が必要")
 
     st.markdown("---")
     
@@ -45,7 +70,7 @@ def render_intelligent_alarm_viewer(bayes_engine, selected_scenario):
 
         data.append({
             "順位": rank,
-            "ID": candidate['id'], # 隠しカラム（参照用）
+            "ID": candidate['id'], 
             "AI診断": status,
             "根本原因分析": f"デバイス: {candidate['id']}\n原因種別: {candidate['type']}",
             "確信度": prob,
@@ -59,7 +84,6 @@ def render_intelligent_alarm_viewer(bayes_engine, selected_scenario):
     df = pd.DataFrame(data)
 
     # 4. インタラクティブなDataFrame表示
-    # on_select="rerun" により、クリック時にアプリが再実行され、選択状態が反映される
     event = st.dataframe(
         df,
         column_order=["順位", "AI診断", "根本原因分析", "確信度", "影響範囲", "推奨アクション"],
@@ -74,18 +98,15 @@ def render_intelligent_alarm_viewer(bayes_engine, selected_scenario):
         use_container_width=True,
         hide_index=True,
         height=250,
-        on_select="rerun",          # ★追加: 選択イベントを有効化
-        selection_mode="single-row" # ★追加: 単一行選択
+        on_select="rerun",          
+        selection_mode="single-row" 
     )
     
-    # 選択された行の候補データを特定して返す
     selected_candidate = None
     
     if len(event.selection.rows) > 0:
-        # ユーザーがクリックした行
         idx = event.selection.rows[0]
         selected_row = df.iloc[idx]
-        # rankingリストから該当する辞書を探す
         target_id = selected_row["ID"]
         target_type = selected_row["Type"]
         for cand in ranking:
@@ -93,7 +114,7 @@ def render_intelligent_alarm_viewer(bayes_engine, selected_scenario):
                 selected_candidate = cand
                 break
     else:
-        # 選択なしの場合はトップ（1位）をデフォルトとする
+        # デフォルトは1位を選択状態にする
         selected_candidate = ranking[0]
         
     return selected_candidate
