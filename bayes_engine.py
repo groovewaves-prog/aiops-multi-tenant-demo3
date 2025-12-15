@@ -1,37 +1,50 @@
 import pandas as pd
-import os
 
 class BayesianRCA:
     def __init__(self, topology):
         self.topology = topology
-        self.evidence = set() # 観測された証拠の集合 (type, value)
+        self.evidence = set() # 観測された証拠 (type, value)
         
-        # 簡易的な知識ベース (World Model)
-        # 本来は学習データから生成しますが、デモ用にルールを内包させます
+        # 知識ベース: 「この障害なら、このアラームが出るはず」という定義
+        # ここでは「確率」ではなく「期待される症状のリスト」として扱います
         self.knowledge_base = {
-            # FW障害パターン
+            # --- FW関連 ---
             ("FW_01_PRIMARY", "Hardware/Physical"): [
-                ("alarm", "Heartbeat Loss"), ("alarm", "HA Failover"), ("log", "Power Fail"), ("ping", "NG")
+                ("alarm", "Heartbeat Loss"), 
+                ("alarm", "HA Failover"), 
+                ("log", "Power Fail"), 
+                ("ping", "NG")
             ],
-            # WANルーター物理障害
+            # --- WANルーター関連 ---
             ("WAN_ROUTER_01", "Hardware/Physical"): [
-                ("alarm", "Power Supply 1 Failed"), ("log", "Interface Down"), ("ping", "NG"), ("log", "System Overheat")
+                ("alarm", "Power Supply 1 Failed"), 
+                ("log", "Interface Down"), 
+                ("ping", "NG"), 
+                ("log", "System Overheat")
             ],
-            # WANルーター設定ミス
             ("WAN_ROUTER_01", "Config/Software"): [
-                ("alarm", "BGP Flapping"), ("log", "Config Error")
+                ("alarm", "BGP Flapping"), 
+                ("log", "Config Error")
             ],
-             # L2スイッチ/AP障害
-            ("L2_SW", "Hardware/Fan"): [
-                ("alarm", "Fan Fail"), ("log", "High Temperature"), ("log", "System Warning")
-            ],
-            # AP障害
-            ("AP_01", "Hardware/Connectivity"): [
-                ("alarm", "Connection Lost"), ("ping", "NG")
-            ],
-            # 複合障害用 (電源+FAN)
             ("WAN_ROUTER_01", "Hardware/Critical_Multi_Fail"): [
-                ("alarm", "Power Supply 1 Failed"), ("alarm", "Fan Fail"), ("log", "System Overheat")
+                ("alarm", "Power Supply 1 Failed"), 
+                ("alarm", "Fan Fail"), 
+                ("log", "System Overheat")
+            ],
+             # --- L2SW / AP関連 ---
+            ("L2_SW", "Hardware/Fan"): [
+                ("alarm", "Fan Fail"), 
+                ("log", "High Temperature"), 
+                ("log", "System Warning")
+            ],
+            ("AP_01", "Network/Connection"): [
+                ("alarm", "Connection Lost"), 
+                ("ping", "NG")
+            ],
+             # --- 外部要因 ---
+            ("External_ISP", "Network"): [
+                ("alarm", "BGP Flapping"), 
+                ("ping", "NG")
             ]
         }
 
@@ -41,67 +54,70 @@ class BayesianRCA:
 
     def get_ranking(self):
         """
-        確率分布ではなく「スコアリング（絶対評価）」でランキングを返す。
-        これにより、複数の障害が同時に起きても、それぞれのスコアが高くなる。
+        【修正版ロジック】
+        ベイズ確率(合計1.0)ではなく、「症状合致スコア(絶対評価)」で計算する。
+        これにより、複合障害時でもスコアが分散せず、両方とも高スコアになる。
         """
         ranking = []
         
-        # トポロジー内の全ノードを評価
-        # デモ簡略化のため、knowledge_baseにあるキーをベースに評価
-        
+        # 評価対象の候補リストを作成
         candidates = list(self.knowledge_base.keys())
         
-        # AP障害など、KBにないIDが来た場合のフォールバック
+        # 動的に候補を追加（KBにないIDへの対応）
+        # もし証拠の中に "Connection Lost" があれば、AP障害を候補に加える
         if any(e[1] == "Connection Lost" for e in self.evidence):
-            candidates.append(("AP_01", "Network/Connection"))
-        
+            if ("AP_01", "Network/Connection") not in candidates:
+                candidates.append(("AP_01", "Network/Connection"))
+
         for cand_id, cand_type in candidates:
-            score = 0.0
-            matched_evidence = []
-            
-            # 期待される症状リストを取得
+            # 1. 期待される症状を取得
             expected_symptoms = self.knowledge_base.get((cand_id, cand_type), [])
             
-            # APなどの動的対応
+            # APなどの特別対応
             if cand_id == "AP_01":
                 expected_symptoms = [("alarm", "Connection Lost"), ("ping", "NG")]
 
             if not expected_symptoms: continue
 
-            # スコアリング: 証拠が一致するたびに加点
-            for ev_type, ev_val in self.evidence:
-                # 完全一致
-                if (ev_type, ev_val) in expected_symptoms:
-                    score += 0.4 # 強い加点
-                    matched_evidence.append(ev_val)
-                # 部分一致（アラームタイプだけ合ってる等）
-                elif any(s[0] == ev_type for s in expected_symptoms):
-                    score += 0.1 # 弱い加点
+            # 2. スコアリング計算 (満点=1.0を目指す加点方式)
+            score = 0.0
+            match_count = 0
             
-            # デモ演出: 特定のキーワードがあれば強制的にスコアを上げる
-            # これにより「AIが確信を持っている」ように見せる
-            if cand_id == "FW_01_PRIMARY" and any(e[1] == "Heartbeat Loss" for e in self.evidence):
-                score = max(score, 0.95)
-            if cand_id == "AP_01" and any(e[1] == "Connection Lost" for e in self.evidence):
-                score = max(score, 0.92)
-            if cand_type == "Hardware/Critical_Multi_Fail" and len([e for e in self.evidence if "Fail" in e[1]]) >= 2:
-                score = max(score, 0.98)
+            for ev_type, ev_val in self.evidence:
+                # A. 完全一致 (TypeもValueも同じ) -> 大きく加点
+                if (ev_type, ev_val) in expected_symptoms:
+                    score += 0.4 
+                    match_count += 1
+                # B. 部分一致 (Typeだけ同じ、あるいは似たアラーム) -> 少し加点
+                elif any(s[0] == ev_type for s in expected_symptoms):
+                    # アラーム内容が違っても、アラームが出ていること自体が重要なら加点
+                    score += 0.05
 
-            # ノイズレベルのスコアは足切りせず、低スコアとして残す
-            # 正規化（合計1.0）はしない。最大値は1.0キャップ。
+            # 3. ブーストロジック（デモの演出用）
+            # 特定のキーワード（決定的な証拠）がある場合は、スコアを跳ね上げる
+            if cand_id == "FW_01_PRIMARY" and any(e[1] == "Heartbeat Loss" for e in self.evidence):
+                score += 0.5
+            if cand_id == "AP_01" and any(e[1] == "Connection Lost" for e in self.evidence):
+                score += 0.5
+            if cand_type == "Hardware/Critical_Multi_Fail" and len([e for e in self.evidence if "Fail" in e[1]]) >= 2:
+                score += 0.6
+
+            # 4. スコアの正規化（キャップ処理）
+            # 確率ではないので、合計が1を超えても良いが、表示用には 1.0 (100%) を上限とする
             final_prob = min(score, 1.0)
             
-            if final_prob > 0.05:
+            # ノイズ除去（スコアが低すぎるものはリストに出さない）
+            if final_prob > 0.1:
                 ranking.append({
                     "id": cand_id,
                     "type": cand_type,
                     "prob": final_prob,
-                    "matched": matched_evidence
+                    "matched": match_count
                 })
         
-        # 何も証拠がない場合のデフォルト（正常）
+        # 候補がない場合
         if not ranking:
-            ranking.append({"id": "System", "type": "Normal", "prob": 0.0, "matched": []})
+            ranking.append({"id": "System", "type": "Normal", "prob": 0.0, "matched": 0})
 
         # スコア順にソート
         ranking.sort(key=lambda x: x["prob"], reverse=True)
