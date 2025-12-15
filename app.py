@@ -4,6 +4,7 @@ import os
 import time
 import google.generativeai as genai
 import json
+from google.api_core import exceptions as google_exceptions
 
 # モジュール群のインポート
 from data import TOPOLOGY
@@ -44,6 +45,16 @@ def load_config_by_id(device_id):
             except Exception:
                 pass
     return "Config file not found."
+
+def generate_content_with_retry(model, prompt, stream=True, retries=3):
+    """503エラー対策のリトライ付き生成関数"""
+    for i in range(retries):
+        try:
+            return model.generate_content(prompt, stream=stream)
+        except google_exceptions.ServiceUnavailable:
+            if i == retries - 1: raise
+            time.sleep(2 * (i + 1))
+    return None
 
 def render_topology(alarms, root_cause_node, root_severity="CRITICAL"):
     """トポロジー図の描画"""
@@ -106,8 +117,7 @@ with st.sidebar:
         "WAN Router": ["4. [WAN] 電源障害：片系", "5. [WAN] 電源障害：両系", "6. [WAN] BGPルートフラッピング", "7. [WAN] FAN故障", "8. [WAN] メモリリーク"],
         "Firewall (Juniper)": ["9. [FW] 電源障害：片系", "10. [FW] 電源障害：両系", "11. [FW] FAN故障", "12. [FW] メモリリーク"],
         "L2 Switch": ["13. [L2SW] 電源障害：片系", "14. [L2SW] 電源障害：両系", "15. [L2SW] FAN故障", "16. [L2SW] メモリリーク"],
-        # ★追加: 複合障害シナリオ
-        "複合・その他": ["17. [WAN] 複合障害：電源＆FAN", "99. [Live] Cisco実機診断"]
+        "複合・その他": ["17. [WAN] 複合障害：電源＆FAN", "18. [Complex] 同時多発：FW & AP", "99. [Live] Cisco実機診断"]
     }
     selected_category = st.selectbox("対象カテゴリ:", list(SCENARIO_MAP.keys()))
     selected_scenario = st.radio("発生シナリオ:", SCENARIO_MAP[selected_category])
@@ -150,7 +160,7 @@ root_severity = "CRITICAL"
 target_device_id = None
 is_live_mode = False
 
-# 1. アラーム生成ロジック (複合障害のロジックを追加)
+# 1. アラーム生成
 if "Live" in selected_scenario: is_live_mode = True
 elif "WAN全回線断" in selected_scenario:
     target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
@@ -165,8 +175,7 @@ elif "L2SWサイレント障害" in selected_scenario:
     if target_device_id:
         child_nodes = [nid for nid, n in TOPOLOGY.items() if n.parent_id == target_device_id]
         alarms = [Alarm(child, "Connection Lost", "CRITICAL") for child in child_nodes]
-elif "複合障害" in selected_scenario:
-    # ★追加: 電源とFANの同時故障
+elif "複合障害" in selected_scenario: # 電源+FAN
     target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
     if target_device_id:
         alarms = [
@@ -174,8 +183,17 @@ elif "複合障害" in selected_scenario:
             Alarm(target_device_id, "Fan Fail", "WARNING")
         ]
         root_severity = "CRITICAL"
+elif "同時多発" in selected_scenario: # FW + AP
+    # ★追加: 異なる設備での同時多発アラーム
+    fw_node = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
+    ap_node = find_target_node_id(TOPOLOGY, node_type="ACCESS_POINT")
+    alarms = []
+    if fw_node: alarms.append(Alarm(fw_node, "Heartbeat Loss", "WARNING"))
+    if ap_node: alarms.append(Alarm(ap_node, "Connection Lost", "CRITICAL"))
+    # 代表ターゲットは便宜上FWにする（マップ表示用）
+    target_device_id = fw_node
+    root_severity = "CRITICAL"
 else:
-    # 単体障害系
     if "[WAN]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="ROUTER")
     elif "[FW]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="FIREWALL")
     elif "[L2SW]" in selected_scenario: target_device_id = find_target_node_id(TOPOLOGY, node_type="SWITCH", layer=4)
@@ -205,13 +223,18 @@ if "bayes_engine" not in st.session_state:
     st.session_state.bayes_engine = BayesianRCA(TOPOLOGY)
     
     if selected_scenario != "正常稼働" and api_key:
-        initial_symptoms = predict_initial_symptoms(selected_scenario, api_key)
-        if initial_symptoms.get("alarm"):
-            st.session_state.bayes_engine.update_probabilities("alarm", initial_symptoms["alarm"])
-        if initial_symptoms.get("ping") == "NG":
-            st.session_state.bayes_engine.update_probabilities("ping", "NG")
-        if initial_symptoms.get("log"):
-            st.session_state.bayes_engine.update_probabilities("log", initial_symptoms["log"])
+        # 同時多発シナリオへの特別な証拠注入
+        if "同時多発" in selected_scenario:
+            st.session_state.bayes_engine.update_probabilities("alarm", "Heartbeat Loss")
+            st.session_state.bayes_engine.update_probabilities("alarm", "Connection Lost")
+        else:
+            initial_symptoms = predict_initial_symptoms(selected_scenario, api_key)
+            if initial_symptoms.get("alarm"):
+                st.session_state.bayes_engine.update_probabilities("alarm", initial_symptoms["alarm"])
+            if initial_symptoms.get("ping") == "NG":
+                st.session_state.bayes_engine.update_probabilities("ping", "NG")
+            if initial_symptoms.get("log"):
+                st.session_state.bayes_engine.update_probabilities("log", initial_symptoms["log"])
 
 # 3. コックピット表示
 selected_incident_candidate = None
@@ -295,6 +318,7 @@ with col_chat:
     if selected_incident_candidate:
         cand = selected_incident_candidate
         
+        # 前回と同じ候補IDなら再生成しない
         should_generate = False
         if "generated_report" not in st.session_state or st.session_state.generated_report is None:
             should_generate = True
@@ -302,81 +326,84 @@ with col_chat:
             should_generate = True
             
         if should_generate:
+            st.info(f"インシデント選択中: **{cand['id']}** ({cand['type']})")
+            
             if api_key and selected_scenario != "正常稼働":
-                
-                report_container = st.empty()
-                target_conf = load_config_by_id(cand['id'])
-                
-                genai.configure(api_key=api_key)
-                model = genai.GenerativeModel("gemma-3-12b-it")
-                
-                prompt = f"""
-                あなたはネットワーク運用監視のプロフェッショナルです。
-                以下の障害インシデントについて、顧客向けの「詳細な状況報告レポート」を作成してください。
-                
-                【入力情報】
-                - 発生シナリオ: {selected_scenario}
-                - 根本原因候補: {cand['id']} ({cand['type']})
-                - AI確信度: {cand['prob']:.1%}
-                - 対象機器Config: 
-                {target_conf[:1500]} (抜粋)
+                if st.button("📝 詳細レポートを作成 (Generate Report)"):
+                    
+                    report_container = st.empty()
+                    target_conf = load_config_by_id(cand['id'])
+                    
+                    genai.configure(api_key=api_key)
+                    model = genai.GenerativeModel("gemma-3-12b-it")
+                    
+                    prompt = f"""
+                    あなたはネットワーク運用監視のプロフェッショナルです。
+                    以下の障害インシデントについて、顧客向けの「詳細な状況報告レポート」を作成してください。
+                    
+                    【入力情報】
+                    - 発生シナリオ: {selected_scenario}
+                    - 根本原因候補: {cand['id']} ({cand['type']})
+                    - AI確信度: {cand['prob']:.1%}
+                    - 対象機器Config: 
+                    {target_conf[:1500]} (抜粋)
 
-                【重要: 出力形式】
-                1. HTMLタグ(brなど)は絶対に使用しないでください。改行はMarkdownの標準的な空行（エンター2回）で行ってください。
-                2. 見出し（###）の前後には必ず空行を入れてください。
-                
-                構成:
-                ### 状況報告：{cand['id']}
-                
-                **1. 障害概要**
-                (概要記述)
-                
-                **2. 影響**
-                (影響記述)
-                
-                **3. 詳細情報**
-                (機器情報など)
-                
-                **4. 対応**
-                (対応策)
-                
-                **5. 今後の対応**
-                (今後)
-                """
-                
-                try:
-                    response = model.generate_content(prompt, stream=True)
-                    full_text = ""
-                    for chunk in response:
-                        if chunk.candidates[0].finish_reason == 1: 
-                             pass 
-                        elif chunk.candidates[0].finish_reason == 3: 
-                             full_text = "⚠️ コンテンツが安全フィルターによりブロックされました。別のシナリオを試してください。"
-                             break
-                        else:
-                             full_text += chunk.text
-                             report_container.markdown(full_text)
+                    【重要: 出力形式】
+                    1. HTMLタグ(brなど)は絶対に使用しないでください。改行はMarkdownの標準的な空行（エンター2回）で行ってください。
+                    2. 見出し（###）の前後には必ず空行を入れてください。
                     
-                    if not full_text: full_text = "レポート生成に失敗しました（空の応答）。"
+                    構成:
+                    ### 状況報告：{cand['id']}
                     
-                    st.session_state.generated_report = full_text
-                    st.session_state.last_report_cand_id = cand['id']
+                    **1. 障害概要**
+                    (概要記述)
                     
-                except Exception as e:
-                    err_msg = f"Report Generation Error: {str(e)}"
-                    st.session_state.generated_report = err_msg
-                    st.error(err_msg)
-            else:
-                 st.session_state.generated_report = "監視中... 異常は検知されていません。"
+                    **2. 影響**
+                    (影響記述)
+                    
+                    **3. 詳細情報**
+                    (機器情報など)
+                    
+                    **4. 対応**
+                    (対応策)
+                    
+                    **5. 今後の対応**
+                    (今後)
+                    """
+                    
+                    try:
+                        response = generate_content_with_retry(model, prompt, stream=True)
+                        full_text = ""
+                        for chunk in response:
+                            if chunk.candidates[0].finish_reason == 1: 
+                                pass 
+                            elif chunk.candidates[0].finish_reason == 3: 
+                                full_text = "⚠️ コンテンツが安全フィルターによりブロックされました。別のシナリオを試してください。"
+                                break
+                            else:
+                                full_text += chunk.text
+                                report_container.markdown(full_text)
+                        
+                        if not full_text: full_text = "レポート生成に失敗しました（空の応答）。"
+                        
+                        st.session_state.generated_report = full_text
+                        st.session_state.last_report_cand_id = cand['id']
+                        
+                    except Exception as e:
+                        err_msg = f"Report Generation Error: {str(e)}"
+                        st.session_state.generated_report = err_msg
+                        st.error("現在、AIモデルが混雑しています (503 Error)。時間を置いて再度お試しください。")
+        else:
+            st.markdown(st.session_state.generated_report)
+            if st.button("🔄 レポート再作成"):
+                st.session_state.generated_report = None
+                st.rerun()
 
-        if st.session_state.generated_report:
-             st.markdown(st.session_state.generated_report)
-    
     # --- B. 自動修復 & チャット ---
     st.markdown("---")
     st.subheader("🤖 Remediation & Chat")
 
-    if selected_incident_candidate and selected_incident_candidate["prob"] > 0.8:
+    if selected_incident_candidate and selected_incident_candidate["prob"] > 0.6:
         if "remediation_plan" not in st.session_state:
             if st.button("✨ 修復プランを作成 (Generate Fix)"):
                  if not api_key: st.error("API Key Required")
@@ -440,6 +467,9 @@ with col_chat:
                     st.session_state.verification_log = None
                     st.session_state.current_scenario = "正常稼働"
                     st.rerun()
+    else:
+        if selected_incident_candidate:
+            st.caption(f"自動修復ボタンは確信度が60%以上の時に表示されます (現在: {selected_incident_candidate['prob']:.1%})")
 
     # チャット (常時表示)
     with st.expander("💬 Chat with AI Agent", expanded=False):
@@ -458,12 +488,15 @@ with col_chat:
                 with st.chat_message("assistant"):
                     with st.spinner("Thinking..."):
                         res_container = st.empty()
-                        response = st.session_state.chat_session.send_message(prompt, stream=True)
-                        full_response = ""
-                        for chunk in response:
-                            full_response += chunk.text
-                            res_container.markdown(full_response)
-                        st.session_state.messages.append({"role": "assistant", "content": full_response})
+                        response = generate_content_with_retry(st.session_state.chat_session.model, prompt, stream=True)
+                        if response:
+                            full_response = ""
+                            for chunk in response:
+                                full_response += chunk.text
+                                res_container.markdown(full_response)
+                            st.session_state.messages.append({"role": "assistant", "content": full_response})
+                        else:
+                            st.error("AIからの応答がありませんでした。")
 
 # ベイズ更新トリガー (診断後)
 if st.session_state.trigger_analysis and st.session_state.live_result:
