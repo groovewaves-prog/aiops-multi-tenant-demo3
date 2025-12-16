@@ -4,6 +4,10 @@ Antigravity Autonomous Agent
 Multi-tenant AIOps Demo
 - All Companies View at TOP
 - Single-tenant Incident Cockpit below
+
+NOTE:
+- logic.py exports simulate_cascade_failure, but find_target_node_id is defined here
+  (it existed in the original app.py in this repo).
 """
 
 from pathlib import Path
@@ -17,14 +21,46 @@ from registry import (
     topology_mtime,
 )
 from inference_engine import LogicalRCA
-from logic import simulate_cascade_failure, find_target_node_id
+from logic import simulate_cascade_failure
 
+
+# =====================
+# Page Config
+# =====================
 st.set_page_config(page_title="Antigravity Autonomous Agent", layout="wide")
 
+
+# =====================
+# Topology helper (kept local: existed in original app.py)
+# =====================
+def find_target_node_id(topology, node_type=None, layer=None, keyword=None):
+    """トポロジーから条件に合うノードIDを検索"""
+    for node_id, node in topology.items():
+        if node_type and node.type != node_type:
+            continue
+        if layer and node.layer != layer:
+            continue
+        if keyword:
+            hit = False
+            if keyword in node_id:
+                hit = True
+            for v in node.metadata.values():
+                if isinstance(v, str) and keyword in v:
+                    hit = True
+            if not hit:
+                continue
+        return node_id
+    return None
+
+
+# =====================
+# Scope helpers
+# =====================
 def _reset_for_scope_change():
     for k in ["logic_engine", "last_alarm_count", "cached_root_cause"]:
         if k in st.session_state:
             del st.session_state[k]
+
 
 def _get_scope():
     tenants = list_tenants()
@@ -52,18 +88,31 @@ def _get_scope():
     )
     return tenant_id, network_id
 
+
 @st.cache_data(show_spinner=False)
 def _load_topology_cached(path: str, mtime: float):
     return load_topology(Path(path))
 
+
+# =====================
+# Sidebar: Scenario
+# =====================
 st.sidebar.markdown("### ⚡ Scenario Controller")
 selected_scenario = st.sidebar.radio(
     "発生シナリオ",
     ["正常稼働", "WAN全回線断", "FW片系障害", "L2SWサイレント障害"],
 )
 
+
+# =====================
+# Title
+# =====================
 st.title("⚡ Antigravity Autonomous Agent")
 
+
+# ==========================================================
+# All Companies View (TOP)
+# ==========================================================
 @st.cache_data(show_spinner=False)
 def summarize_scope(tenant_id, network_id, scenario, mtime):
     paths = get_paths(tenant_id, network_id)
@@ -111,6 +160,7 @@ def summarize_scope(tenant_id, network_id, scenario, mtime):
         "suspected": suspected,
     }
 
+
 def render_all_companies_view(scenario):
     st.subheader("🏢 All Companies View")
 
@@ -133,8 +183,13 @@ def render_all_companies_view(scenario):
 
     st.divider()
 
+
 render_all_companies_view(selected_scenario)
 
+
+# ==========================================================
+# Incident Cockpit (Single Tenant)
+# ==========================================================
 tenant_id, network_id = _get_scope()
 paths = get_paths(tenant_id, network_id)
 
