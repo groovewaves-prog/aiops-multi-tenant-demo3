@@ -2,7 +2,7 @@ import json
 import os
 import re
 from enum import Enum
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import google.generativeai as genai
 
@@ -18,11 +18,16 @@ class HealthStatus(Enum):
 class LogicalRCA:
     """
     LogicalRCA:
-      - LLM によるコンフィグ解釈（ベンダ差分の吸収）
       - トポロジー文脈（親子関係）を用いたカスケード抑制
-      - “冗長が効いてるなら黄色、止まってるなら赤” を優先
+      - “冗長が効いてるなら黄色、止まってるなら赤” をローカル安全ルールで優先
+      - LLM は不足情報の補完にのみ使用（APIキーがある場合）
       - LLM無しでも安定するように、FAN/メモリ系のローカル安全ルールを追加
+      - “サイレント障害” は子の Connection Lost 集中から親を被疑箇所として推定（能動調査レポート付き）
     """
+
+    # サイレント障害推定の閾値（運用で微調整する前提）
+    SILENT_MIN_CHILDREN = 2
+    SILENT_RATIO = 0.5  # 親配下の子のうち、何割以上が同時に落ちたら親を疑うか
 
     def __init__(self, topology, config_dir: str = "./configs"):
         """
@@ -39,6 +44,14 @@ class LogicalRCA:
         self.config_dir = config_dir
         self.model = None
         self._api_configured = False
+
+        # parent -> [children...]
+        self.children_map: Dict[str, List[str]] = {}
+        for dev_id, info in self.topology.items():
+            if isinstance(info, dict):
+                p = info.get("parent_id")
+                if p:
+                    self.children_map.setdefault(p, []).append(dev_id)
 
     # ----------------------------
     # Topology helpers
@@ -66,16 +79,23 @@ class LogicalRCA:
 
     def _get_psu_count(self, device_id: str, default: int = 1) -> int:
         """
-        topology.json の metadata.hw_inventory.psu_count を参照。
-        存在しない場合は default（1）を返す。
+        topology.json の metadata.hw_inventory.psu_count を優先参照。
+        無い場合は metadata.redundancy_type が 'PSU' なら 2 を仮定（現場の直感に近い）。
         """
         md = self._get_metadata(device_id)
-        hw = md.get("hw_inventory", {}) if isinstance(md, dict) else {}
-        try:
-            psu = hw.get("psu_count", default) if isinstance(hw, dict) else default
-            return int(psu)
-        except Exception:
-            return default
+        if isinstance(md, dict):
+            hw = md.get("hw_inventory", {})
+            if isinstance(hw, dict) and "psu_count" in hw:
+                try:
+                    return int(hw.get("psu_count"))
+                except Exception:
+                    pass
+
+            # ヒューリスティック：冗長種別が PSU と明記されている機器は 2 を仮定
+            if str(md.get("redundancy_type", "")).upper() == "PSU":
+                return 2
+
+        return default
 
     # ----------------------------
     # LLM init
@@ -131,6 +151,63 @@ class LogicalRCA:
         return text
 
     # ==========================================================
+    # Silent failure inference
+    # ==========================================================
+    def _is_connection_loss(self, msg: str) -> bool:
+        return ("Connection Lost" in msg) or ("Link Down" in msg) or ("Port Down" in msg) or ("Unreachable" in msg)
+
+    def _detect_silent_failures(self, msg_map: Dict[str, List[str]]) -> Dict[str, Dict[str, Any]]:
+        """
+        サイレント障害推定：
+          - 親自身にアラームがなくても、配下の複数子が Connection Lost を出しているなら親を疑う
+        戻り値:
+          parent_id -> { children: [...], evidence_count: int, total_children: int, report: str }
+        """
+        suspects: Dict[str, Dict[str, Any]] = {}
+
+        for parent_id, children in self.children_map.items():
+            if not children:
+                continue
+            # 親自身に既にアラームがあるなら「サイレント」とは見なさない（通常フローに任せる）
+            if parent_id in msg_map:
+                continue
+
+            affected = []
+            for c in children:
+                msgs = msg_map.get(c, [])
+                if any(self._is_connection_loss(m) for m in msgs):
+                    affected.append(c)
+
+            if not affected:
+                continue
+
+            total = len(children)
+            ratio = len(affected) / max(total, 1)
+
+            # 閾値判定
+            if len(affected) >= self.SILENT_MIN_CHILDREN and ratio >= self.SILENT_RATIO:
+                report = (
+                    f"[Silent Failure Heuristic]\n"
+                    f"- Suspected upstream device: {parent_id}\n"
+                    f"- Affected children: {len(affected)}/{total} (ratio={ratio:.2f})\n"
+                    f"- Evidence: children raised Connection Lost/Unreachable simultaneously\n"
+                    f"- Recommended checks:\n"
+                    f"  1) Check uplink interface counters/errors on {parent_id}\n"
+                    f"  2) Verify MAC table / ARP / STP state changes around incident time\n"
+                    f"  3) Compare syslog/event logs for link flap, STP re-convergence\n"
+                    f"  4) Run targeted ping/ARP from CORE side to affected APs\n"
+                )
+                suspects[parent_id] = {
+                    "children": affected,
+                    "evidence_count": len(affected),
+                    "total_children": total,
+                    "ratio": ratio,
+                    "report": report,
+                }
+
+        return suspects
+
+    # ==========================================================
     # Public API
     # ==========================================================
     def analyze(self, alarms: List) -> List[Dict[str, Any]]:
@@ -147,9 +224,17 @@ class LogicalRCA:
                 "reason": "No active alerts detected."
             }]
 
+        # device_id -> [messages...]
         msg_map: Dict[str, List[str]] = {}
         for a in alarms:
             msg_map.setdefault(a.device_id, []).append(a.message)
+
+        # (A) サイレント障害推定（親にアラームが無いケースを救う）
+        silent_suspects = self._detect_silent_failures(msg_map)
+
+        # サイレント疑いの親は、疑似アラームとして msg_map に追加して分析対象に入れる
+        for parent_id, info in silent_suspects.items():
+            msg_map.setdefault(parent_id, []).append("Silent Failure Suspected (Derived from child Connection Lost)")
 
         alarmed_ids = set(msg_map.keys())
 
@@ -157,9 +242,30 @@ class LogicalRCA:
             p = self._get_parent_id(dev)
             return bool(p and (p in alarmed_ids))
 
+        def parent_is_silent_suspect(dev: str) -> bool:
+            p = self._get_parent_id(dev)
+            return bool(p and (p in silent_suspects))
+
         results: List[Dict[str, Any]] = []
 
+        # デバイス単位で判断（まとめて渡す）
         for device_id, messages in msg_map.items():
+
+            # (B) サイレント障害が推定されている親配下の子は “被疑箇所”扱いに寄せる
+            #     ＝子自身を根本原因にしない（コックピットに子だけ出る問題の抑止）
+            if parent_is_silent_suspect(device_id) and any(self._is_connection_loss(m) for m in messages):
+                p = self._get_parent_id(device_id)
+                results.append({
+                    "id": device_id,
+                    "label": " / ".join(messages),
+                    "prob": 0.4,
+                    "type": "Network/ConnectionLost",
+                    "tier": 3,
+                    "reason": f"Downstream symptom under suspected silent failure parent (parent={p})."
+                })
+                continue
+
+            # (C) 通常のカスケード抑制（親もアラーム中のときの子の Unreachable）
             if any("Unreachable" in m for m in messages) and parent_is_alarmed(device_id):
                 p = self._get_parent_id(device_id)
                 results.append({
@@ -172,8 +278,30 @@ class LogicalRCA:
                 })
                 continue
 
+            # (D) 冗長性/停止の判定（ローカル安全ルール→必要ならLLM）
             analysis = self.analyze_redundancy_depth(device_id, messages)
 
+            # (E) サイレント推定の親は “黄色・高優先度” に寄せる（赤にはしない）
+            if device_id in silent_suspects:
+                info = silent_suspects[device_id]
+                results.append({
+                    "id": device_id,
+                    "label": " / ".join(messages),
+                    "prob": 0.8,
+                    "type": "Network/SilentFailure",
+                    "tier": 1,
+                    "reason": f"Silent failure suspected: {info['evidence_count']}/{info['total_children']} children affected.",
+                    "analyst_report": info["report"],
+                    "auto_investigation": [
+                        "Pull interface counters/errors (uplinks)",
+                        "Check STP/MAC flaps",
+                        "Ping/ARP reachability tests from upstream",
+                        "Correlate syslog around incident time"
+                    ]
+                })
+                continue
+
+            # 3) 確信度マッピング
             if analysis.get("impact_type") == "UNKNOWN" and "API key not configured" in analysis.get("reason", ""):
                 prob = 0.5
                 tier = 3
@@ -237,6 +365,7 @@ class LogicalRCA:
 
         # ----------------------------------------------------------
         # (1) 電源：片系（黄色/赤）
+        #   ※ topology に psu_count が無くても redundancy_type=PSU なら 2 を仮定（黄色に寄せる）
         # ----------------------------------------------------------
         psu_count = self._get_psu_count(device_id, default=1)
         psu_single_fail = (
@@ -258,7 +387,6 @@ class LogicalRCA:
 
         # ----------------------------------------------------------
         # (2) FAN 故障：基本は黄色、ただし過熱/停止兆候があれば赤
-        #   app.py では 'Fan Fail' を生成しているため、それを確実に捕捉
         # ----------------------------------------------------------
         fan_fail = ("Fan Fail" in joined) or ("FAN" in joined and "Fail" in joined) or ("Fan" in joined and "Fail" in joined)
         overheat_hint = ("High Temperature" in joined) or ("Overheat" in joined) or ("Thermal" in joined)
@@ -276,11 +404,11 @@ class LogicalRCA:
             }
 
         # ----------------------------------------------------------
-        # (3) メモリ高騰/リーク：基本は黄色、OOM/プロセスクラッシュ兆候があれば赤
-        #   app.py では 'Memory High' を生成しているため、それを確実に捕捉
+        # (3) メモリ高騰/リーク：基本は黄色、OOM/クラッシュ兆候があれば赤
         # ----------------------------------------------------------
-        mem_symptom = ("Memory High" in joined) or ("Memory Leak" in joined) or ("memory" in joined.lower() and ("leak" in joined.lower() or "high" in joined.lower()))
-        oom_hint = ("Out of memory" in joined) or ("OOM" in joined) or ("killed process" in joined.lower()) or ("kernel panic" in joined.lower())
+        joined_lower = joined.lower()
+        mem_symptom = ("Memory High" in joined) or ("Memory Leak" in joined) or ("memory" in joined_lower and ("leak" in joined_lower or "high" in joined_lower))
+        oom_hint = ("Out of memory" in joined) or ("OOM" in joined) or ("killed process" in joined_lower) or ("kernel panic" in joined_lower)
         if mem_symptom:
             if oom_hint:
                 return {
