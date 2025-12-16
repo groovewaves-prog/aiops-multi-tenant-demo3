@@ -215,6 +215,37 @@ def _health_from_alarm_count(n: int) -> str:
     return "Down"
 
 
+
+def _health_from_alarms(selected_scenario: str, alarms: List[Alarm]) -> str:
+    """全社一覧（状態ボード）向けの簡易Health判定（モック）
+    優先度:
+      1) “停止”が明確なシナリオは Down（停止）
+      2) CRITICAL + Device Down系は Down、それ以外のCRITICALは Degraded
+      3) WARNINGは件数で Watch/Degraded を切る
+    """
+    if not alarms:
+        return "Good"
+
+    # シナリオ起因で停止が明確なもの
+    if ("WAN全回線断" in selected_scenario) or ("電源障害：両系" in selected_scenario):
+        return "Down"
+
+    severities = [str(getattr(a, "severity", "")).upper() for a in alarms]
+    messages = [str(getattr(a, "message", "")) for a in alarms]
+
+    if any(s == "CRITICAL" for s in severities):
+        if any(("Device Down" in m) or ("Dual Loss" in m) for m in messages):
+            return "Down"
+        return "Degraded"
+
+    n = len(alarms)
+    if n < 3:
+        return "Watch"
+    if n < 10:
+        return "Degraded"
+    return "Down"
+
+
 @st.cache_data(show_spinner=False)
 def _summarize_one_scope(tenant_id: str, network_id: str, selected_scenario: str, mtime: float) -> Dict[str, Any]:
     paths = get_paths(tenant_id, network_id)
