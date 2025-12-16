@@ -1,16 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-app_cards_multitenant_v5_statusboard_delta_maint_scroll3rows.py
+app_cards_multitenant_v6_statusboard_delta_maint_scroll5rows.py
 
-要件:
-- 状態ボード（停止 → 劣化 → 要注意 → 正常）を全社横並びで表示
-- 各列は「デフォルト3行表示」＋縦スクロール（行が増えても画面が伸びない）
-- デルタ表示（変化があった会社だけを一覧に出す）
-- Maintenance グレーアウト（最小版：手動フラグ）
-- 発生シナリオは “最初の app.py” の SCENARIO_MAP / アラーム生成ロジックに合わせる
-- HTML/CSSは使わない（Streamlit標準のみ）
+変更点（v5→v6）
+- st.dataframe(height=...) を「5行相当」に変更（列内スクロールは維持）
+- 将来の「行クリックで tenant/network 切替」実装に向けて、選択状態を session_state に保持する枠だけ追加
+  ※ Streamlitのバージョンにより、st.dataframe の行クリック選択APIが使えない場合があるため、
+     ここでは UI を壊さない “準備だけ” に留めています。
 
 注意:
+- HTML/CSSは使いません（Streamlit標準のみ）。
 - 下段の「AIOps インシデント・コックピット」は、元の app.py からそのまま貼り付けて復活してください。
 """
 
@@ -48,8 +47,9 @@ STATUS_ICON = {"停止": "🟥", "劣化": "🟧", "要注意": "🟨", "正常"
 DELTA_WINDOW_MIN = 15
 MAX_ROWS_PER_BUCKET = 500  # 将来スケールの安全弁（UI保護）
 
-# “デフォルト3行表示”のための dataframe 高さ（ヘッダ＋3行ぶん）
-DF_HEIGHT_3ROWS = 35 * 4 + 6  # だいたい (ヘッダ1行 + データ3行)
+# “デフォルト5行表示”のための dataframe 高さ（ヘッダ＋5行ぶん目安）
+# 環境差があるので「だいたい」ですが、ここを固定すると “縦に伸びずスクロール” を実現できます。
+DF_HEIGHT_5ROWS = 35 * 6 + 6  # (ヘッダ1行 + データ5行)
 
 # -----------------------------
 # Scenario map（最初の app.py に準拠）
@@ -119,7 +119,6 @@ def _find_target_node_id(
     layer: Optional[int] = None,
     keyword: Optional[str] = None,
 ) -> Optional[str]:
-    """最初の app.py の find_target_node_id 相当（最小）。"""
     for node_id, node in topology.items():
         if node_type and _node_type(node) != node_type:
             continue
@@ -132,11 +131,7 @@ def _find_target_node_id(
 
 
 def _make_alarms(topology: Dict[str, Any], selected_scenario: str) -> List[Alarm]:
-    """
-    最初の app.py の「# 1. アラーム生成ロジック」に合わせた挙動。
-    """
     alarms: List[Alarm] = []
-    # Live はここではアラームを生成しない（運用上は別導線）
     if "Live" in selected_scenario:
         return alarms
 
@@ -157,8 +152,10 @@ def _make_alarms(topology: Dict[str, Any], selected_scenario: str) -> List[Alarm
         if target_device_id not in topology:
             target_device_id = _find_target_node_id(topology, keyword="L2_SW")
         if target_device_id and target_device_id in topology:
-            # 親(L2)は落ちていないが、配下が落ちる（サイレント障害）
-            child_nodes = [nid for nid, n in topology.items() if getattr(n, "parent_id", None) == target_device_id]
+            child_nodes = [
+                nid for nid, n in topology.items()
+                if getattr(n, "parent_id", None) == target_device_id
+            ]
             alarms = [Alarm(child, "Connection Lost", "CRITICAL") for child in child_nodes]
         return alarms
 
@@ -180,7 +177,6 @@ def _make_alarms(topology: Dict[str, Any], selected_scenario: str) -> List[Alarm
             alarms.append(Alarm(ap_node, "Connection Lost", "CRITICAL"))
         return alarms
 
-    # それ以外： [WAN] / [FW] / [L2SW] を device type にマップ
     target_device_id = None
     if "[WAN]" in selected_scenario:
         target_device_id = _find_target_node_id(topology, node_type="ROUTER")
@@ -195,7 +191,6 @@ def _make_alarms(topology: Dict[str, Any], selected_scenario: str) -> List[Alarm
     if "電源障害：片系" in selected_scenario:
         alarms = [Alarm(target_device_id, "Power Supply 1 Failed", "WARNING")]
     elif "電源障害：両系" in selected_scenario:
-        # FWだけは単体Down、それ以外はカスケード
         if "FW" in str(target_device_id):
             alarms = [Alarm(target_device_id, "Power Supply: Dual Loss (Device Down)", "CRITICAL")]
         else:
@@ -211,7 +206,6 @@ def _make_alarms(topology: Dict[str, Any], selected_scenario: str) -> List[Alarm
 
 
 def _health_from_alarm_count(n: int) -> str:
-    # デモ用閾値（将来はSLO/重要度で差し替え）
     if n == 0:
         return "Good"
     if n < 5:
@@ -243,7 +237,7 @@ def _summarize_one_scope(tenant_id: str, network_id: str, selected_scenario: str
     return {
         "tenant": tenant_id,
         "network": network_id,
-        "health": health,  # internal: Good/Watch/Degraded/Down
+        "health": health,
         "alarms": alarm_count,
         "suspected": suspected,
     }
@@ -325,13 +319,16 @@ def _render_bucket_df(items: List[Dict[str, Any]], deltas: Dict[str, Dict[str, A
         out.append(
             {
                 "会社/ネットワーク": f"{display_company(tenant)} / {network}",
+                "tenant": tenant,     # 将来の行クリック遷移用（内部列）
+                "network": network,   # 将来の行クリック遷移用（内部列）
                 "Maintenance": "🛠️" if is_maint else "",
                 "Δ": _delta_text(delta) if (delta is not None) else "",
                 "Alarms": ("" if is_maint else int(r["alarms"])),
                 "Suspected": ("" if is_maint else (r.get("suspected") or "")),
             }
         )
-    return pd.DataFrame(out)
+    df = pd.DataFrame(out)
+    return df
 
 
 def _render_status_board(rows: List[Dict[str, Any]]):
@@ -348,6 +345,9 @@ def _render_status_board(rows: List[Dict[str, Any]]):
     col_down, col_degraded, col_watch, col_good = st.columns(4)
     col_map = {"停止": col_down, "劣化": col_degraded, "要注意": col_watch, "正常": col_good}
 
+    # 将来の「行クリックで選択」用の置き場（まだUI連携はしない）
+    st.session_state.setdefault("selected_scope", {"tenant": None, "network": None})
+
     for status_jp in STATUS_ORDER:
         items = buckets[status_jp]
         items.sort(key=lambda x: x["alarms"], reverse=True)
@@ -359,12 +359,14 @@ def _render_status_board(rows: List[Dict[str, Any]]):
 
             df = _render_bucket_df(items, deltas, maint)
 
-            # デフォルト3行表示＋縦スクロール
+            # 表示用：内部列 tenant/network は隠す
+            view_df = df.drop(columns=["tenant", "network"], errors="ignore")
+
             st.dataframe(
-                df,
+                view_df,
                 use_container_width=True,
                 hide_index=True,
-                height=DF_HEIGHT_3ROWS,
+                height=DF_HEIGHT_5ROWS,
             )
 
             if len(items) > MAX_ROWS_PER_BUCKET:
