@@ -499,10 +499,10 @@ for key in ["live_result", "messages", "chat_session", "trigger_analysis", "veri
 # マルチテナントでは tenant/network 切替でトポロジーが変わるため、
 # LogicalRCA は毎回「現在スコープの TOPOLOGY」で初期化する必要があります。
 try:
-    topo_mtime = os.path.getmtime(paths.topology_path)
+    topo_mtime = os.path.getmtime(_paths.topology_path)
 except Exception:
     topo_mtime = 0.0
-engine_sig = f"{selected_tenant}/{selected_network}:{topo_mtime}"
+engine_sig = f"{ACTIVE_TENANT}/{ACTIVE_NETWORK}:{topo_mtime}"
 
 if st.session_state.get("logic_engine_sig") != engine_sig:
     st.session_state.logic_engine = LogicalRCA(TOPOLOGY)
