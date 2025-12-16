@@ -14,6 +14,14 @@ from network_ops import run_diagnostic_simulation, generate_remediation_commands
 from verifier import verify_log_content, format_verification_report
 from inference_engine import LogicalRCA
 
+# --- Multi-tenant registry (optional) ---
+try:
+    from registry import list_tenants, list_networks, get_paths, load_topology
+    HAS_REGISTRY = True
+except Exception:
+    HAS_REGISTRY = False
+
+
 # --- ページ設定 ---
 st.set_page_config(page_title="Antigravity Autonomous", page_icon="⚡", layout="wide")
 
@@ -108,7 +116,6 @@ def render_topology(alarms, root_cause_candidates):
     return graph
 
 # --- UI構築 ---
-st.title("⚡ Antigravity Autonomous Agent")
 
 api_key = None
 if "GOOGLE_API_KEY" in st.secrets:
@@ -118,6 +125,17 @@ else:
 
 # --- サイドバー ---
 with st.sidebar:
+    # --- Tenant/Network selector (multi-tenant) ---
+    if HAS_REGISTRY:
+        tenants = list_tenants()
+        tenant_id = st.selectbox("Tenant", tenants, index=0, key="tenant_id")
+        networks = list_networks(tenant_id)
+        network_id = st.selectbox("Network", networks, index=0, key="network_id")
+        st.markdown("---")
+    else:
+        tenant_id = "A"
+        network_id = "default"
+
     st.header("⚡ Scenario Controller")
     SCENARIO_MAP = {
         "基本・広域障害": ["正常稼働", "1. WAN全回線断", "2. FW片系障害", "3. L2SWサイレント障害"],
@@ -144,9 +162,20 @@ for key in ["live_result", "messages", "chat_session", "trigger_analysis", "veri
     if key not in st.session_state:
         st.session_state[key] = None if key != "messages" and key != "trigger_analysis" else ([] if key == "messages" else False)
 
+# --- tenant scope: load topology/configs when multi-tenant is available ---
+if HAS_REGISTRY:
+    try:
+        _paths = get_paths(tenant_id, network_id)
+        TOPOLOGY = load_topology(_paths.topology_path)
+        CONFIG_DIR = str(_paths.config_dir)
+    except Exception:
+        CONFIG_DIR = "configs"
+else:
+    CONFIG_DIR = "configs"
+
 # エンジン初期化
 if not st.session_state.logic_engine:
-    st.session_state.logic_engine = LogicalRCA(TOPOLOGY)
+    st.session_state.logic_engine = LogicalRCA(TOPOLOGY, config_dir=CONFIG_DIR)
 
 # シナリオ切り替え時のリセット
 if st.session_state.current_scenario != selected_scenario:
@@ -231,6 +260,88 @@ else:
 
 # 2. 推論エンジンによる分析
 analysis_results = st.session_state.logic_engine.analyze(alarms)
+
+
+# ==================================================
+# 0. 全社一覧ビュー（カード）
+# ==================================================
+def _health_from_alarm_count(n: int) -> str:
+    if n <= 0:
+        return "Good"
+    if n < 5:
+        return "Watch"
+    if n < 15:
+        return "Degraded"
+    return "Down"
+
+
+def _make_alarms_for_topology(_topology, _scenario: str):
+    _alarms = []
+    try:
+        if "WAN全回線断" in _scenario or "[WAN]" in _scenario:
+            _target = find_target_node_id(_topology, node_type="ROUTER", keyword="WAN") or find_target_node_id(_topology, node_type="ROUTER")
+            if _target:
+                _alarms = simulate_cascade_failure(_target, _topology, "Interface Down")
+        elif "FW" in _scenario or "Firewall" in _scenario or "[FW]" in _scenario:
+            _target = find_target_node_id(_topology, node_type="FIREWALL")
+            if _target:
+                _alarms = simulate_cascade_failure(_target, _topology, "Unreachable")
+        elif "L2SW" in _scenario or "L2 Switch" in _scenario or "[L2SW]" in _scenario:
+            _target = find_target_node_id(_topology, node_type="SWITCH", layer=2) or find_target_node_id(_topology, node_type="SWITCH", layer=4)
+            if _target:
+                _alarms = simulate_cascade_failure(_target, _topology, "Link Degraded")
+        else:
+            _alarms = []
+    except Exception:
+        _alarms = []
+    return _alarms
+
+
+def render_all_companies_cards(_scenario: str):
+    """上部に表示する全社カードサマリ。元のUIを壊さないため、ここでは軽量表示のみ。"""
+    if not HAS_REGISTRY:
+        return
+
+    st.subheader("🏢 全社一覧（サマリ）")
+
+    rows = []
+    for _t in list_tenants():
+        for _n in list_networks(_t):
+            _p = get_paths(_t, _n)
+            try:
+                _topo = load_topology(_p.topology_path)
+            except Exception:
+                continue
+            _alarms = _make_alarms_for_topology(_topo, _scenario)
+            _health = _health_from_alarm_count(len(_alarms))
+            rows.append({"tenant": _t, "network": _n, "health": _health, "alarms": len(_alarms)})
+
+    # 集計カード（Good/Watch/Degraded/Down）
+    good = sum(1 for r in rows if r["health"] == "Good")
+    watch = sum(1 for r in rows if r["health"] == "Watch")
+    degraded = sum(1 for r in rows if r["health"] == "Degraded")
+    down = sum(1 for r in rows if r["health"] == "Down")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Good", good)
+    c2.metric("Watch", watch)
+    c3.metric("Degraded", degraded)
+    c4.metric("Down", down)
+
+    # 重要度順（Down→Degraded→Watch→Good, alarms desc）
+    order = {"Down": 0, "Degraded": 1, "Watch": 2, "Good": 3}
+    rows.sort(key=lambda r: (order.get(r["health"], 9), -r["alarms"] ))
+
+    st.caption("※ まずは“状態の読み取り速度”を上げるため、カード化を最優先で実装しています。")
+    grid = st.columns(4)
+    for i, r in enumerate(rows[:12]):
+        col = grid[i % 4]
+        with col:
+            st.metric(f"{r['tenant']} / {r['network']}", r['health'], f"Alarms: {r['alarms']}")
+
+    st.divider()
+
+render_all_companies_cards(selected_scenario)
 
 # 3. コックピット表示
 selected_incident_candidate = None
