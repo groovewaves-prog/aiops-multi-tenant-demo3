@@ -1,6 +1,0 @@
-streamlit
-google-generativeai
-graphviz
-netmiko
-rich
-pandas
