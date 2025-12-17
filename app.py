@@ -439,141 +439,189 @@ def _build_company_rows(selected_scenario: str):
 
 def _render_all_companies_board(selected_scenario: str, df_height: int = 220):
     """
-    ハイブリッド型全社ダッシュボード
-    
-    上部30%: ツリーマップで全体俯瞰（100社規模でも1画面）
-    下部70%: 優先度別トリアージリスト（Priority High / Watch List / All Systems）
+    UX改善版: ハイブリッド型全社ダッシュボード
+    - KPIメトリクス + カスタム配色ツリーマップ
+    - 説得力のあるデータグリッド型トリアージリスト
     """
-    st.subheader("🏢 全社状態ボード（ツリーマップ + トリアージ）")
-    
     rows = _build_company_rows(selected_scenario)
     
-    # ========================================
-    # 上部: ツリーマップ（30%）- 全体俯瞰
-    # ========================================
-    with st.container():
-        st.caption("📊 全社ステータス・ヒートマップ（四角の大きさ=アラーム数、色=ステータス）")
+    # 集計
+    df_rows = pd.DataFrame(rows)
+    count_stop = len(df_rows[df_rows['status'] == '停止'])
+    count_action = len(df_rows[df_rows['status'] == '要対応'])
+    count_warn = len(df_rows[df_rows['status'] == '注意'])
+    count_normal = len(df_rows[df_rows['status'] == '正常'])
+
+    st.subheader("🏢 全社状態ボード")
+
+    # 1. KPI メトリクス (状況を数値で即座に把握)
+    # -------------------------------------------------------
+    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+    kpi1.metric("🔴 停止 (最優先)", f"{count_stop}社", delta=None, help="即時対応が必要です")
+    kpi2.metric("🟠 要対応", f"{count_action}社", help="冗長性喪失など")
+    kpi3.metric("🟡 注意", f"{count_warn}社", help="監視強化推奨")
+    kpi4.metric("🟢 正常稼働", f"{count_normal}社")
+    
+    st.divider()
+
+    # 2. 視覚的ツリーマップ (ノイズを消し、異常を目立たせる)
+    # -------------------------------------------------------
+    try:
+        import plotly.express as px
         
-        # Plotlyインポート
-        try:
-            import plotly.express as px
-        except ImportError:
-            st.warning("Plotlyがインストールされていません。pip install plotly を実行してください。")
-            return
+        # 配色定義: 正常は目立たない色(グレー/薄緑)にし、異常を原色にする
+        color_map = {
+            "停止": "#DC2626",    # Vivid Red
+            "要対応": "#F97316",  # Orange
+            "注意": "#EAB308",    # Yellow
+            "正常": "#F3F4F6"     # Very Light Grey (ノイズ低減)
+        }
         
-        # ツリーマップ用データ準備
-        treemap_data = []
+        # ツリーマップ用データ加工
+        tree_data = []
         for r in rows:
-            # 色の値を数値化（停止=4, 要対応=3, 注意=2, 正常=1）
-            color_value = {"停止": 4, "要対応": 3, "注意": 2, "正常": 1}.get(r["status"], 1)
-            
-            treemap_data.append({
-                "company": r["company_network"],
-                "status": r["status"],
-                "alarms": max(r["alarm_count"], 1),  # 0だとツリーマップに表示されない
-                "color_value": color_value,
-                "tenant": r["tenant"],
-                "network": r["network"]
+            # 正常の面積を少し小さく評価して、異常を目立たせる重みづけ
+            weight = r['alarm_count'] + (10 if r['status'] == '停止' else 1)
+            tree_data.append({
+                "Label": r["company_network"],
+                "Status": r["status"],
+                "Weight": weight, 
+                "Alarms": r["alarm_count"],
+                "Tenant": r["tenant"],
+                "Network": r["network"]
             })
         
-        if treemap_data:
-            df_tree = pd.DataFrame(treemap_data)
-            
-            # ツリーマップ描画
+        df_tree = pd.DataFrame(tree_data)
+        
+        if not df_tree.empty:
             fig = px.treemap(
                 df_tree,
-                path=['status', 'company'],
-                values='alarms',
-                color='color_value',
-                color_continuous_scale=[
-                    [0, '#22c55e'],    # 正常: 緑
-                    [0.33, '#eab308'],  # 注意: 黄
-                    [0.66, '#f97316'],  # 要対応: オレンジ
-                    [1, '#ef4444']      # 停止: 赤
-                ],
-                hover_data={'alarms': True, 'color_value': False}
+                path=['Status', 'Label'],
+                values='Weight',
+                color='Status',
+                color_discrete_map=color_map,
+                hover_data={'Alarms': True, 'Weight': False, 'Status': False},
+                custom_data=['Tenant', 'Network']
             )
             
             fig.update_layout(
-                height=250,
                 margin=dict(t=0, b=0, l=0, r=0),
-                coloraxis_showscale=False
+                height=250,
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                font=dict(family="Inter, sans-serif", size=14)
             )
-            
+            # クリックイベントはStreamlitでは完全には取れないため、視覚化に徹する
             st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.info("表示するデータがありません。")
+            
+    except ImportError:
+        st.error("Plotly package is required for the dashboard.")
+
+    # 3. トリアージ・グリッド (説得力のあるリスト表示)
+    # -------------------------------------------------------
+    st.markdown("### 🚨 自動トリアージ・リスト")
+
+    # データフレーム構築用ヘルパー
+    def make_display_df(target_rows):
+        d = []
+        for r in target_rows:
+            # 深刻度を数値化してバー表示用にする
+            severity_score = 100 if r['status'] == '停止' else (70 if r['status'] == '要対応' else 30)
+            if r['status'] == '正常': severity_score = 0
+            
+            d.append({
+                "Status": r['status'],
+                "Company": r['company_network'],
+                "Severity": severity_score,
+                "Alarms": r['alarm_count'],
+                "Update": "Just now", # 本来はtimestamp
+                "Action": "詳細確認",
+                "raw_tenant": r['tenant'],
+                "raw_network": r['network']
+            })
+        return pd.DataFrame(d)
+
+    # --- Priority High (停止・要対応) ---
+    high_priority_rows = [r for r in rows if r['status'] in ['停止', '要対応']]
     
-    st.markdown("---")
-    
-    # ========================================
-    # 下部: トリアージリスト（70%）- 具体的対応
-    # ========================================
-    
-    # ステータス別に分類
-    priority_high = [r for r in rows if r["status"] == "停止"]
-    watch_list = [r for r in rows if r["status"] in ["要対応", "注意"]]
-    normal = [r for r in rows if r["status"] == "正常"]
-    
-    # Priority High（直ちに対応が必要）
-    if priority_high:
-        st.markdown(f"### 🚨 Priority High (直ちに対応が必要) - {len(priority_high)}社")
-        st.caption("サービス停止中。即座に対応が必要です。")
+    if high_priority_rows:
+        df_high = make_display_df(high_priority_rows)
         
-        for idx, r in enumerate(sorted(priority_high, key=lambda x: -x["alarm_count"]), 1):
-            col1, col2, col3, col4 = st.columns([0.5, 2.5, 1.2, 0.8])
-            
-            with col1:
-                st.markdown(f"**{idx}.**")
-            with col2:
-                maint_badge = " 🛠️" if r["maintenance"] else ""
-                st.markdown(f"🔴 **{r['company_network']}**{maint_badge}")
-            with col3:
-                delta_str = ""
-                if r["delta"] is not None and r["delta"] != 0:
-                    delta_str = f" (Δ{r['delta']:+d})"
-                st.markdown(f"アラーム: **{r['alarm_count']}**{delta_str}")
-            with col4:
-                if st.button("詳細 →", key=f"detail_{r['tenant']}_{r['network']}", type="primary"):
-                    st.session_state.selected_scope = {"tenant": r["tenant"], "network": r["network"]}
-                    st.rerun()
+        st.caption(f"直ちに対応が必要なシステム ({len(high_priority_rows)}件)")
         
-        st.markdown("")
-    
-    # Watch List（要注意）
-    if watch_list:
-        with st.expander(f"⚠️ Watch List (要注意・傾向監視) - {len(watch_list)}社", expanded=False):
-            st.caption("冗長性喪失や警告が発生しています。監視が必要です。")
-            
-            for r in sorted(watch_list, key=lambda x: -x["alarm_count"]):
-                col1, col2, col3 = st.columns([2.5, 1.2, 0.8])
-                
-                icon = "🟠" if r["status"] == "要対応" else "🟡"
-                maint_badge = " 🛠️" if r["maintenance"] else ""
-                
-                with col1:
-                    st.markdown(f"{icon} {r['company_network']}{maint_badge}")
-                with col2:
-                    st.markdown(f"アラーム: {r['alarm_count']}")
-                with col3:
-                    if st.button("詳細", key=f"watch_{r['tenant']}_{r['network']}"):
-                        st.session_state.selected_scope = {"tenant": r["tenant"], "network": r["network"]}
-                        st.rerun()
-    
-    # All Systems（正常）
-    if normal:
-        with st.expander(f"✅ All Systems (正常稼働) - {len(normal)}社", expanded=False):
-            st.caption("これらの会社は正常に稼働しています。")
-            
-            # 3列レイアウトで表示
-            cols_per_row = 3
-            for i in range(0, len(normal), cols_per_row):
-                cols = st.columns(cols_per_row)
-                for j, col in enumerate(cols):
-                    if i + j < len(normal):
-                        r = normal[i + j]
-                        with col:
-                            st.markdown(f"🟢 {r['company_network']}")
+        event = st.dataframe(
+            df_high,
+            column_order=["Status", "Company", "Severity", "Alarms", "Update"],
+            column_config={
+                "Status": st.column_config.TextColumn("状態", width="small"),
+                "Company": st.column_config.TextColumn("対象システム", width="medium"),
+                "Severity": st.column_config.ProgressColumn(
+                    "深刻度", 
+                    format="%d%%", 
+                    min_value=0, 
+                    max_value=100,
+                    width="medium"
+                ),
+                "Alarms": st.column_config.NumberColumn("アラーム数", format="%d件"),
+                "raw_tenant": None, # 非表示
+                "raw_network": None # 非表示
+            },
+            use_container_width=True,
+            hide_index=True,
+            selection_mode="single-row",
+            on_select="rerun",
+            key="grid_high"
+        )
+        
+        # 選択処理
+        if len(event.selection.rows) > 0:
+            selected_idx = event.selection.rows[0]
+            sel_row = df_high.iloc[selected_idx]
+            st.session_state.selected_scope = {
+                "tenant": sel_row['raw_tenant'], 
+                "network": sel_row['raw_network']
+            }
+            st.rerun()
+    else:
+        st.info("🎉 現在、緊急対応が必要なインシデントはありません。")
+
+    # --- Watch List (注意) ---
+    warn_rows = [r for r in rows if r['status'] == '注意']
+    if warn_rows:
+        with st.expander(f"⚠️ Watch List ({len(warn_rows)}件) - 傾向監視", expanded=False):
+            df_warn = make_display_df(warn_rows)
+            event_w = st.dataframe(
+                df_warn,
+                column_order=["Status", "Company", "Severity", "Alarms"],
+                column_config={
+                    "Status": st.column_config.TextColumn("状態"),
+                    "Severity": st.column_config.ProgressColumn("負荷レベル", format="%d", max_value=100),
+                    "raw_tenant": None, "raw_network": None
+                },
+                use_container_width=True,
+                hide_index=True,
+                selection_mode="single-row",
+                on_select="rerun",
+                key="grid_warn"
+            )
+             # 選択処理
+            if len(event_w.selection.rows) > 0:
+                selected_idx = event_w.selection.rows[0]
+                sel_row = df_warn.iloc[selected_idx]
+                st.session_state.selected_scope = {
+                    "tenant": sel_row['raw_tenant'], 
+                    "network": sel_row['raw_network']
+                }
+                st.rerun()
+
+    # --- Normal (正常) ---
+    # 正常は邪魔にならないよう極小化
+    if count_normal > 0:
+        with st.expander(f"✅ 正常稼働システム ({count_normal}件)", expanded=False):
+            st.caption("以下のシステムは正常に稼働しています。")
+            # シンプルなチップ表示
+            normal_labels = [r['company_network'] for r in rows if r['status'] == '正常']
+            st.write(", ".join(normal_labels))
 
 # ==========================================
 def find_target_node_id(topology, node_type=None, layer=None, keyword=None):
